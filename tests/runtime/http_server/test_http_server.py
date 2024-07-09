@@ -18,7 +18,8 @@ Tests for the caikit HTTP server
 from contextlib import contextmanager
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Iterable
+from unittest import mock
 import base64
 import json
 import os
@@ -30,17 +31,21 @@ import zipfile
 from fastapi.testclient import TestClient
 import pytest
 import requests
-import tls_test_tools
 
 # Local
-from caikit.core import MODEL_MANAGER, DataObjectBase, dataobject
+from caikit.core import MODEL_MANAGER
 from caikit.core.data_model import TrainingStatus
 from caikit.core.model_management.multi_model_finder import MultiModelFinder
 from caikit.runtime import http_server
 from caikit.runtime.http_server.http_server import StreamEventTypes
-from tests.conftest import temp_config
+from caikit.runtime.server_base import ServerThreadPool
+from tests.conftest import get_mutable_config_copy, reset_globals, temp_config
+from tests.core.helpers import MockBackend
+from tests.fixtures import Fixtures
 from tests.runtime.conftest import (
     ModuleSubproc,
+    deploy_good_model_files,
+    generate_tls_configs,
     register_trained_model,
     runtime_http_test_server,
 )
@@ -48,146 +53,30 @@ from tests.runtime.model_management.test_model_manager import (
     non_singleton_model_managers,
 )
 
-## Fixtures #####################################################################
+################################################################################
+# NOTE for test authors:
+#
+# This test module is quite large. Please write tests under the appropriate
+# header section so that tests can be more easily discovered and managed as the
+# test suite grows.
+################################################################################
 
-
-@pytest.fixture
-def client(runtime_http_server) -> TestClient:
-    with TestClient(runtime_http_server.app) as client:
-        yield client
-
-
-## Helpers #####################################################################
-
-
-def save_key_cert_pair(prefix, workdir, key=None, cert=None):
-    crtfile, keyfile = None, None
-    if key is not None:
-        keyfile = os.path.join(workdir, f"{prefix}.key")
-        with open(keyfile, "w") as handle:
-            handle.write(key)
-    if cert is not None:
-        crtfile = os.path.join(workdir, f"{prefix}.crt")
-        with open(crtfile, "w") as handle:
-            handle.write(cert)
-    return crtfile, keyfile
-
-
-@dataobject
-class KeyPair(DataObjectBase):
-    cert: str
-    key: str
-
-
-@dataobject
-class TLSConfig(DataObjectBase):
-    server: KeyPair
-    client: KeyPair
+## Fixtures ####################################################################
 
 
 @contextmanager
-def generate_tls_configs(
-    port: int,
-    tls: bool = False,
-    mtls: bool = False,
-    inline: bool = False,
-    separate_client_ca: bool = False,
-    server_sans: Optional[List[str]] = None,
-    client_sans: Optional[List[str]] = None,
-    **http_config_overrides,
-) -> Dict[str, Dict]:
-    """Helper to generate tls configs"""
-    with tempfile.TemporaryDirectory() as workdir:
-        config_overrides = {}
-        client_keyfile, client_certfile = None, None
-        ca_cert, server_cert, server_key = None, None, None
-        use_in_test = config_overrides.setdefault("use_in_test", {})
-        use_in_test["workdir"] = workdir
-        if mtls or tls:
-            ca_key = tls_test_tools.generate_key()[0]
-            ca_cert = tls_test_tools.generate_ca_cert(ca_key)
-            server_key, server_cert = tls_test_tools.generate_derived_key_cert_pair(
-                ca_key=ca_key,
-                san_list=server_sans,
-            )
-            server_certfile, server_keyfile = save_key_cert_pair(
-                "server", workdir, server_key, server_cert
-            )
-
-            if inline:
-                tls_config = TLSConfig(
-                    server=KeyPair(cert=server_cert, key=server_key),
-                    client=KeyPair(cert="", key=""),
-                )
-            else:
-                tls_config = TLSConfig(
-                    server=KeyPair(cert=server_certfile, key=server_keyfile),
-                    client=KeyPair(cert="", key=""),
-                )
-
-            # need to save this ca_certfile in config_overrides so the tls
-            # tests below can access it from client side
-            ca_certfile, _ = save_key_cert_pair("ca", workdir, cert=ca_cert)
-            use_in_test["ca_cert"] = ca_certfile
-            use_in_test["server_key"] = server_keyfile
-            use_in_test["server_cert"] = server_certfile
-
-            # also saving a bad ca_certfile for a failure test case
-            bad_ca_file = os.path.join(workdir, "bad_ca_cert.crt")
-            with open(bad_ca_file, "w") as handle:
-                bad_cert = (
-                    "-----BEGIN CERTIFICATE-----\nfoobar\n-----END CERTIFICATE-----"
-                )
-                handle.write(bad_cert)
-            use_in_test["bad_ca_cert"] = bad_ca_file
-
-            if mtls:
-                if separate_client_ca:
-                    subject_kwargs = {"common_name": "my.client"}
-                    client_ca_key = tls_test_tools.generate_key()[0]
-                    client_ca_cert = tls_test_tools.generate_ca_cert(
-                        client_ca_key, **subject_kwargs
-                    )
-                else:
-                    subject_kwargs = {}
-                    client_ca_key = ca_key
-                    client_ca_cert = ca_cert
-
-                # If inlining the client CA
-                if inline:
-                    tls_config.client.cert = client_ca_cert
-                else:
-                    client_ca_certfile, _ = save_key_cert_pair(
-                        "client_ca", workdir, cert=client_ca_cert
-                    )
-                    tls_config.client.cert = client_ca_certfile
-
-                # Set up the client key/cert pair derived from the client CA
-                client_certfile, client_keyfile = save_key_cert_pair(
-                    "client",
-                    workdir,
-                    *tls_test_tools.generate_derived_key_cert_pair(
-                        ca_key=client_ca_key,
-                        san_list=client_sans,
-                        **subject_kwargs,
-                    ),
-                )
-                # need to save the client cert and key in config_overrides so the mtls test below can access it
-                use_in_test["client_cert"] = client_certfile
-                use_in_test["client_key"] = client_keyfile
-
-            config_overrides["runtime"] = {"tls": tls_config.to_dict()}
-        config_overrides.setdefault("runtime", {})["http"] = {
-            "server_shutdown_grace_period_seconds": 0.01,  # this is so the server is killed after 0.1 if no test is running
-            "port": port,
-            **http_config_overrides,
-        }
-
-        with temp_config(config_overrides, "merge"):
-            yield config_overrides
+def client_context(server) -> Iterable[TestClient]:
+    with TestClient(server.app) as client:
+        yield client
 
 
-## Insecure and TLS Tests #######################################################################
+@pytest.fixture
+def client(runtime_http_server) -> Iterable[TestClient]:
+    with client_context(runtime_http_server) as client:
+        yield client
+
+
+## Insecure and TLS Tests ######################################################
 
 
 def test_insecure_server(runtime_http_server, open_port):
@@ -309,11 +198,10 @@ def test_mutual_tls_server_with_wrong_cert(open_port):
 
 
 @pytest.mark.parametrize(
-    "enabled_services",
+    ["enable_inference", "enable_training"],
     [(True, False), (False, True), (False, False)],
 )
-def test_services_disabled(open_port, enabled_services):
-    enable_inference, enable_training = enabled_services
+def test_services_disabled(open_port, enable_inference, enable_training):
     with temp_config(
         {
             "runtime": {
@@ -332,17 +220,98 @@ def test_services_disabled(open_port, enabled_services):
             )
             resp.raise_for_status()
             assert server.enable_inference == enable_inference
-            assert (server.global_predict_servicer and enable_inference) or (
-                server.global_predict_servicer is None and not enable_inference
+            assert (
+                server.global_predict_servicer
+                and server.model_management_servicer
+                and enable_inference
+            ) or (
+                server.global_predict_servicer is None
+                and server.model_management_servicer is None
+                and not enable_inference
             )
             assert server.enable_training == enable_training
-            # TODO: Update once training enabled
-            # assert (server.global_train_servicer and enable_training) or (
-            #     server.global_train_servicer is None and not enable_training
-            # )
+            assert (
+                server.global_train_servicer
+                and server.training_management_servicer
+                and enable_training
+            ) or (
+                server.global_train_servicer is None
+                and server.training_management_servicer is None
+                and not enable_training
+            )
 
 
-## Inference Tests #######################################################################
+@pytest.mark.parametrize(
+    ["config_overrides", "expected"],
+    [
+        ({}, None),
+        ({"runtime": {"http": {"server_config": {"limit_concurrency": 0}}}}, None),
+        ({"runtime": {"http": {"server_config": {"limit_concurrency": 123}}}}, 123),
+        (
+            {
+                "runtime": {
+                    "server_thread_pool_size": 4,
+                    "http": {"server_config": {"limit_concurrency": -1}},
+                }
+            },
+            8,
+        ),
+    ],
+)
+def test_http_server_concurrency_limiting(config_overrides, expected):
+    """Make sure that when the config for limiting concurrency is set, it is
+    correctly parsed when initializing the server
+    """
+    with temp_config(config_overrides, merge_strategy="merge"):
+        with mock.patch.object(
+            ServerThreadPool, "pool", ServerThreadPool._build_pool()
+        ):
+            svr = http_server.RuntimeHTTPServer()
+            assert svr.server.config.limit_concurrency == expected
+
+
+## Lifecycle Tests #############################################################
+
+
+def test_http_server_shutdown_with_model_poll(open_port):
+    """Test that a SIGINT successfully shuts down the running server"""
+    with tempfile.TemporaryDirectory() as workdir:
+        server_proc = ModuleSubproc(
+            "caikit.runtime.http_server",
+            RUNTIME_HTTP_PORT=str(open_port),
+            RUNTIME_LOCAL_MODELS_DIR=workdir,
+            RUNTIME_LAZY_LOAD_LOCAL_MODELS="true",
+            RUNTIME_LAZY_LOAD_POLL_PERIOD_SECONDS="0.1",
+        )
+        with server_proc as proc:
+            # Wait for the server to be up
+            while True:
+                try:
+                    resp = requests.get(
+                        f"http://localhost:{open_port}{http_server.HEALTH_ENDPOINT}",
+                        timeout=0.1,
+                    )
+                    resp.raise_for_status()
+                    break
+                except (
+                    requests.HTTPError,
+                    requests.ConnectionError,
+                    requests.ConnectTimeout,
+                ):
+                    pass
+
+            # Signal the server to shut down
+            proc.send_signal(signal.SIGINT)
+
+        # Make sure the process was not killed
+        assert not server_proc.killed
+
+
+def test_http_and_grpc_server_share_threadpool(
+    runtime_http_server, runtime_grpc_server
+):
+    """Test that the grpc server and http server share a common thread pool"""
+    assert runtime_grpc_server.thread_pool is runtime_http_server.thread_pool
 
 
 def test_docs(client):
@@ -367,6 +336,65 @@ def test_docs_with_models(
     assert response.status_code == 200
 
 
+def test_uvicorn_server_config_valid():
+    """Make sure that arbitrary uvicorn configs can be passed through from
+    runtime.http.server_config
+    """
+    timeout_keep_alive = 10
+    with temp_config(
+        {
+            "runtime": {
+                "http": {"server_config": {"timeout_keep_alive": timeout_keep_alive}}
+            }
+        },
+        "merge",
+    ):
+        server = http_server.RuntimeHTTPServer()
+        assert server.server.config.timeout_keep_alive == timeout_keep_alive
+
+
+def test_uvicorn_server_config_invalid_tls_overlap():
+    """Make sure uvicorn TLS arguments cannot be set if TLS is enabled in caikit
+    config
+    """
+    with temp_config(
+        {
+            "runtime": {
+                "http": {
+                    "server_config": {
+                        "ssl_keyfile": "/some/file.pem",
+                    }
+                }
+            }
+        },
+        "merge",
+    ):
+        with generate_tls_configs(port=1234, tls=True, mtls=True):
+            with pytest.raises(ValueError):
+                http_server.RuntimeHTTPServer()
+
+
+def test_uvicorn_server_config_invalid_kwarg_overlap():
+    """Make sure uvicorn config can't be set for configs that caikit manages"""
+    with temp_config(
+        {
+            "runtime": {
+                "http": {
+                    "server_config": {
+                        "log_level": "debug",
+                    }
+                }
+            }
+        },
+        "merge",
+    ):
+        with pytest.raises(ValueError):
+            http_server.RuntimeHTTPServer()
+
+
+## Inference Tests #############################################################
+
+
 def test_inference_sample_task(sample_task_model_id, client):
     """Simple check that we can ping a model"""
     json_input = {"inputs": {"name": "world"}, "model_id": sample_task_model_id}
@@ -374,7 +402,7 @@ def test_inference_sample_task(sample_task_model_id, client):
         f"/api/v1/task/sample",
         json=json_input,
     )
-    json_response = json.loads(response.content.decode(response.default_encoding))
+    json_response = response.json()
     assert response.status_code == 200, json_response
     assert json_response["greeting"] == "Hello world"
 
@@ -397,7 +425,7 @@ def test_inference_primitive_task(primitive_task_model_id, client):
         f"/api/v1/task/sample",
         json=json_input,
     )
-    json_response = json.loads(response.content.decode(response.default_encoding))
+    json_response = response.json()
     assert response.status_code == 200, json_response
     assert "hello: primitives!" in json_response["greeting"]
 
@@ -429,7 +457,7 @@ def test_inference_sample_task_multipart_input(sample_task_model_id, client):
 
     response = client.post(f"/api/v1/task/sample", files=multipart_input)
 
-    json_response = json.loads(response.content.decode(response.default_encoding))
+    json_response = response.json()
     assert response.status_code == 200, json_response
     assert json_response["greeting"] == "Hello world"
 
@@ -481,7 +509,7 @@ def test_inference_other_task(other_task_model_id, client):
         f"/api/v1/task/other",
         json=json_input,
     )
-    json_response = json.loads(response.content.decode(response.default_encoding))
+    json_response = response.json()
     assert response.status_code == 200, json_response
     assert json_response["farewell"] == "goodbye: world 42 times"
 
@@ -538,7 +566,7 @@ def test_invalid_input_exception(file_task_model_id, client):
         json=json_file_input,
     )
     assert response.status_code == 400
-    json_response = json.loads(response.content.decode(response.default_encoding))
+    json_response = response.json()
     assert json_response["details"] == "Executables are not a supported File type"
 
 
@@ -664,7 +692,7 @@ def test_inference_malformed_param(client):
     )
     assert response.status_code == 422
 
-    json_response = json.loads(response.content.decode(response.default_encoding))
+    json_response = response.json()
 
     assert "Invalid JSON" in json_response["details"]
     assert json_response["additional_info"][0]["type"] == "json_invalid"
@@ -683,7 +711,7 @@ def test_inference_non_serializable_json(client):
     )
     assert response.status_code == 422
 
-    json_response = json.loads(response.content.decode(response.default_encoding))
+    json_response = response.json()
 
     assert "Invalid JSON" in json_response["details"]
     assert json_response["additional_info"][0]["type"] == "json_invalid"
@@ -696,9 +724,7 @@ def test_no_model_id(client):
         json={"inputs": {"name": "world"}},
     )
     assert response.status_code == 400
-    "Please provide model_id in payload" in response.content.decode(
-        response.default_encoding
-    )
+    assert "Please provide model_id in payload" in response.json()["details"]
 
 
 def test_inference_multi_task_module(multi_task_model_id, client):
@@ -712,7 +738,7 @@ def test_inference_multi_task_module(multi_task_model_id, client):
         f"/api/v1/task/second",
         json=json_input,
     )
-    json_response = json.loads(response.content.decode(response.default_encoding))
+    json_response = response.json()
     assert response.status_code == 200, json_response
     assert json_response["farewell"] == "Goodbye from SecondTask"
 
@@ -777,7 +803,7 @@ def test_inference_sample_task_incorrect_input(sample_task_model_id, client):
         json=json_input,
     )
     assert response.status_code == 422
-    json_response = json.loads(response.content.decode(response.default_encoding))
+    json_response = response.json()
     # assert standard fields in the response
     assert json_response["details"] is not None
     assert json_response["code"] is not None
@@ -797,9 +823,139 @@ def test_inference_sample_task_forward_compatibility(sample_task_model_id, clien
         f"/api/v1/task/sample",
         json=json_input,
     )
-    json_response = json.loads(response.content.decode(response.default_encoding))
+    json_response = response.json()
     assert response.status_code == 200, json_response
     assert json_response["greeting"] == "Hello world"
+
+
+def test_http_inference_notifies_backends_of_context(
+    sample_task_model_id,
+    client,
+    reset_globals,
+):
+    """Test that inference calls notify the configured backends with the request
+    context
+    """
+    # Use an "override" config to explicitly set the backend priority list
+    # rather than prepend to it
+    override_config = get_mutable_config_copy()
+    override_config["model_management"]["initializers"]["default"]["config"][
+        "backend_priority"
+    ] = [
+        {"type": MockBackend.backend_type},
+        {"type": "LOCAL"},
+    ]
+
+    with temp_config(override_config, "override"):
+        # Get the mock backend
+        mock_backend = [
+            be
+            for be in MODEL_MANAGER.get_module_backends()
+            if isinstance(be, MockBackend)
+        ]
+        assert len(mock_backend) == 1
+        mock_backend = mock_backend[0]
+        assert not mock_backend.runtime_contexts
+
+        # Make an inference call
+        json_input = {"inputs": {"name": "world"}, "model_id": sample_task_model_id}
+        response = client.post(
+            f"/api/v1/task/sample",
+            json=json_input,
+        )
+        json_response = response.json()
+        assert response.status_code == 200, json_response
+        assert json_response["greeting"] == "Hello world"
+
+        # Make sure the context was registered
+        assert list(mock_backend.runtime_contexts.keys()) == [sample_task_model_id]
+
+
+def test_http_inference_streaming_notifies_backends_of_context(
+    sample_task_model_id,
+    runtime_http_server,
+    reset_globals,
+):
+    """Check that module context is registered with streaming requests"""
+    # Use an "override" config to explicitly set the backend priority list
+    # rather than prepend to it
+    override_config = get_mutable_config_copy()
+    override_config["model_management"]["initializers"]["default"]["config"][
+        "backend_priority"
+    ] = [
+        {"type": MockBackend.backend_type},
+        {"type": "LOCAL"},
+    ]
+
+    with temp_config(override_config, "override"):
+        # Get the mock backend
+        mock_backend = [
+            be
+            for be in MODEL_MANAGER.get_module_backends()
+            if isinstance(be, MockBackend)
+        ]
+        assert len(mock_backend) == 1
+        mock_backend = mock_backend[0]
+        assert not mock_backend.runtime_contexts
+
+        # Make a streaming inference call
+        input_json = {"model_id": sample_task_model_id, "inputs": {"name": "world"}}
+        url = f"http://localhost:{runtime_http_server.port}/api/v1/task/server-streaming-sample"
+        stream = requests.post(url=url, json=input_json, verify=False)
+        assert stream.status_code == 200
+        stream.content.decode(stream.encoding)
+
+        # Make sure the context was registered
+        assert list(mock_backend.runtime_contexts.keys()) == [sample_task_model_id]
+
+
+def test_inference_trace(sample_task_model_id, open_port):
+    """Test that tracing is called when enabled"""
+
+    class SpanMock:
+        def __init__(self):
+            self.attrs = {}
+
+        def set_attribute(self, key, val):
+            self.attrs[key] = val
+
+    span_mock = SpanMock()
+    span_context_mock = mock.MagicMock()
+    tracer_mock = mock.MagicMock()
+    get_tracer_mock = mock.MagicMock()
+    get_trace_context = mock.MagicMock()
+    tracer_mock.start_as_current_span.return_value = span_context_mock
+    span_context_mock.__enter__.return_value = span_mock
+    get_tracer_mock.return_value = tracer_mock
+    dummy_context = {"dummy": "context"}
+    get_trace_context.return_value = dummy_context
+
+    with mock.patch("caikit.runtime.trace.get_tracer", get_tracer_mock):
+        with mock.patch("caikit.runtime.trace.get_trace_context", get_trace_context):
+            with runtime_http_test_server(open_port) as server:
+                with client_context(server) as client:
+                    json_input = {
+                        "inputs": {"name": "world"},
+                        "model_id": sample_task_model_id,
+                    }
+                    response = client.post(f"/api/v1/task/sample", json=json_input)
+                    json_response = response.json()
+                    assert response.status_code == 200, json_response
+                    assert json_response["greeting"] == "Hello world"
+
+                    # Make sure tracing called
+                    get_tracer_mock.assert_called_once()
+                    tracer_mock.start_as_current_span.call_count == 2
+                    assert (
+                        tracer_mock.start_as_current_span.mock_calls[0].kwargs.get(
+                            "context"
+                        )
+                        is dummy_context
+                    )
+                    assert span_mock.attrs.get("model_id") == sample_task_model_id
+
+
+## Info Tests ##################################################################
 
 
 def test_health_check_ok(client):
@@ -815,7 +971,7 @@ def test_runtime_info_ok(runtime_http_server):
         response = client.get(http_server.RUNTIME_INFO_ENDPOINT)
         assert response.status_code == 200
 
-        json_response = json.loads(response.content.decode(response.default_encoding))
+        json_response = response.json()
         assert "caikit" in json_response["python_packages"]
         # runtime_version not added if not set
         assert json_response["runtime_version"] == ""
@@ -841,9 +997,7 @@ def test_runtime_info_ok_response_all_packages(runtime_http_server):
             response = client.get(http_server.RUNTIME_INFO_ENDPOINT)
             assert response.status_code == 200
 
-            json_response = json.loads(
-                response.content.decode(response.default_encoding)
-            )
+            json_response = response.json()
             assert json_response["runtime_version"] == "1.2.3"
             assert "caikit" in json_response["python_packages"]
             # dependent libraries versions added
@@ -861,9 +1015,7 @@ def test_runtime_info_ok_custom_python_packages(runtime_http_server):
             response = client.get(http_server.RUNTIME_INFO_ENDPOINT)
             assert response.status_code == 200
 
-            json_response = json.loads(
-                response.content.decode(response.default_encoding)
-            )
+            json_response = response.json()
             # runtime_version not added if not set
             assert json_response["runtime_version"] == ""
             # custom library is set while other random packages are not
@@ -877,7 +1029,7 @@ def test_all_models_info_ok(client, sample_task_model_id):
     response = client.get(http_server.MODELS_INFO_ENDPOINT)
     assert response.status_code == 200
 
-    json_response = json.loads(response.content.decode(response.default_encoding))
+    json_response = response.json()
     # Assert some models are loaded
     assert len(json_response["models"]) > 0
 
@@ -899,7 +1051,7 @@ def test_single_models_info_ok(client, sample_task_model_id):
     )
     assert response.status_code == 200
 
-    json_response = json.loads(response.content.decode(response.default_encoding))
+    json_response = response.json()
     # Assert some models are loaded
     assert len(json_response["models"]) == 1
 
@@ -908,41 +1060,7 @@ def test_single_models_info_ok(client, sample_task_model_id):
     assert model["module_metadata"]["name"] == "SampleModule"
 
 
-def test_http_server_shutdown_with_model_poll(open_port):
-    """Test that a SIGINT successfully shuts down the running server"""
-    with tempfile.TemporaryDirectory() as workdir:
-        server_proc = ModuleSubproc(
-            "caikit.runtime.http_server",
-            RUNTIME_HTTP_PORT=str(open_port),
-            RUNTIME_LOCAL_MODELS_DIR=workdir,
-            RUNTIME_LAZY_LOAD_LOCAL_MODELS="true",
-            RUNTIME_LAZY_LOAD_POLL_PERIOD_SECONDS="0.1",
-        )
-        with server_proc as proc:
-            # Wait for the server to be up
-            while True:
-                try:
-                    resp = requests.get(
-                        f"http://localhost:{open_port}{http_server.HEALTH_ENDPOINT}",
-                        timeout=0.1,
-                    )
-                    resp.raise_for_status()
-                    break
-                except (
-                    requests.HTTPError,
-                    requests.ConnectionError,
-                    requests.ConnectTimeout,
-                ):
-                    pass
-
-            # Signal the server to shut down
-            proc.send_signal(signal.SIGINT)
-
-        # Make sure the process was not killed
-        assert not server_proc.killed
-
-
-## Train Tests #######################################################################
+## Train Tests #################################################################
 
 
 def test_train_sample_task(client, runtime_http_server):
@@ -955,14 +1073,12 @@ def test_train_sample_task(client, runtime_http_server):
         },
     }
     training_response = client.post(
-        f"/api/v1/SampleTaskSampleModuleTrain",
+        "/api/v1/SampleTaskSampleModuleTrain",
         json=json_input,
     )
 
     # assert training response
-    training_json_response = json.loads(
-        training_response.content.decode(training_response.default_encoding)
-    )
+    training_json_response = training_response.json()
     assert training_response.status_code == 200, training_json_response
     assert (training_id := training_json_response["training_id"])
     assert training_json_response["model_name"] == model_name
@@ -988,7 +1104,7 @@ def test_train_sample_task(client, runtime_http_server):
         f"/api/v1/task/sample",
         json=json_input_inference,
     )
-    json_response = json.loads(response.content.decode(response.default_encoding))
+    json_response = response.json()
     assert response.status_code == 200, json_response
     assert json_response["greeting"] == "Hello world"
 
@@ -1010,11 +1126,9 @@ def test_train_sample_task_throws_s3_value_error(client):
     )
     assert (
         "S3 output path not supported by this runtime"
-        in training_response.content.decode(training_response.default_encoding)
+        in training_response.json()["details"]
     )
-    assert training_response.status_code == 500, training_response.content.decode(
-        training_response.default_encoding
-    )
+    assert training_response.status_code == 500, training_response.json()
 
 
 def test_train_primitive_task(client, runtime_http_server):
@@ -1040,9 +1154,7 @@ def test_train_primitive_task(client, runtime_http_server):
         json=json_input,
     )
     # assert training response
-    training_json_response = json.loads(
-        training_response.content.decode(training_response.default_encoding)
-    )
+    training_json_response = training_response.json()
     assert training_response.status_code == 200, training_json_response
     assert (training_id := training_json_response["training_id"])
     assert training_json_response["model_name"] == model_name
@@ -1072,7 +1184,7 @@ def test_train_primitive_task(client, runtime_http_server):
         f"/api/v1/task/sample",
         json=json_input_inference,
     )
-    json_response = json.loads(response.content.decode(response.default_encoding))
+    json_response = response.json()
     assert response.status_code == 200, json_response
     assert json_response["greeting"] == "hello: primitives! [1, 2, 3] 100"
 
@@ -1092,9 +1204,7 @@ def test_train_other_task(client, runtime_http_server):
         json=json_input,
     )
     # assert training response
-    training_json_response = json.loads(
-        training_response.content.decode(training_response.default_encoding)
-    )
+    training_json_response = training_response.json()
     assert training_response.status_code == 200, training_json_response
     assert (training_id := training_json_response["training_id"])
     assert training_json_response["model_name"] == model_name
@@ -1120,15 +1230,9 @@ def test_train_other_task(client, runtime_http_server):
         f"/api/v1/task/other",
         json=json_input_inference,
     )
-    json_response = json.loads(response.content.decode(response.default_encoding))
+    json_response = response.json()
     assert response.status_code == 200, json_response
     assert json_response["farewell"] == "goodbye: world 64 times"
-
-
-def test_http_and_grpc_server_share_threadpool(
-    runtime_http_server, runtime_grpc_server
-):
-    assert runtime_grpc_server.thread_pool is runtime_http_server.thread_pool
 
 
 def test_train_long_running_sample_task(client, runtime_http_server):
@@ -1148,9 +1252,7 @@ def test_train_long_running_sample_task(client, runtime_http_server):
     )
 
     # assert training response received before training completed
-    training_json_response = json.loads(
-        training_response.content.decode(training_response.default_encoding)
-    )
+    training_json_response = training_response.json()
     assert training_response.status_code == 200, training_json_response
     assert (training_id := training_json_response["training_id"])
     assert training_json_response["model_name"] == model_name
@@ -1165,57 +1267,222 @@ def test_train_long_running_sample_task(client, runtime_http_server):
     assert model_future.get_info().status.is_terminal
 
 
-def test_uvicorn_server_config_valid():
-    """Make sure that arbitrary uvicorn configs can be passed through from
-    runtime.http.server_config
+## Management Tests ############################################################
+
+
+def test_model_management_deploy_lifecycle(open_port, deploy_good_model_files):
+    """Test that models can be deployed/undeployed and reflect in the
+    local_models_dir
     """
-    timeout_keep_alive = 10
-    with temp_config(
-        {
-            "runtime": {
-                "http": {"server_config": {"timeout_keep_alive": timeout_keep_alive}}
-            }
-        },
-        "merge",
-    ):
-        server = http_server.RuntimeHTTPServer()
-        assert server.server.config.timeout_keep_alive == timeout_keep_alive
+    with tempfile.TemporaryDirectory() as workdir:
+        with non_singleton_model_managers(
+            1,
+            {
+                "runtime": {
+                    "local_models_dir": workdir,
+                    "lazy_load_local_models": True,
+                },
+            },
+            "merge",
+        ):
+            with runtime_http_test_server(open_port) as server:
+                with client_context(server) as client:
 
+                    # Make sure no models loaded initially
+                    resp = client.get(http_server.MODELS_INFO_ENDPOINT)
+                    resp.raise_for_status()
+                    model_info = resp.json()
+                    assert len(model_info["models"]) == 0
 
-def test_uvicorn_server_config_invalid_tls_overlap():
-    """Make sure uvicorn TLS arguments cannot be set if TLS is enabled in caikit
-    config
-    """
-    with temp_config(
-        {
-            "runtime": {
-                "http": {
-                    "server_config": {
-                        "ssl_keyfile": "/some/file.pem",
+                    # Do the deploy
+                    model_id = "my-model"
+                    deploy_req = {
+                        "model_id": model_id,
+                        "model_files": [
+                            {
+                                "filename": fname,
+                                "data": base64.b64encode(data).decode("utf-8"),
+                            }
+                            for fname, data in deploy_good_model_files.items()
+                        ],
                     }
-                }
-            }
-        },
-        "merge",
-    ):
-        with generate_tls_configs(port=1234, tls=True, mtls=True):
-            with pytest.raises(ValueError):
-                http_server.RuntimeHTTPServer()
+                    resp = client.post(
+                        http_server.MODEL_MANAGEMENT_ENDPOINT, json=deploy_req
+                    )
+                    resp.raise_for_status()
+                    resp_json = resp.json()
+                    assert resp_json["name"] == model_id
+                    model_path = os.path.join(workdir, model_id)
+                    assert resp_json["model_path"] == model_path
+                    assert os.path.isdir(model_path)
+
+                    # Make sure the model shows up in info
+                    resp = client.get(http_server.MODELS_INFO_ENDPOINT)
+                    resp.raise_for_status()
+                    model_info = resp.json()
+                    assert len(model_info["models"]) == 1
+                    assert model_info["models"][0]["name"] == model_id
+
+                    # Make sure an appropriate error is raised for trying to
+                    # deploy the same model again
+                    resp = client.post(
+                        http_server.MODEL_MANAGEMENT_ENDPOINT, json=deploy_req
+                    )
+                    assert resp.status_code == 409
+
+                    # Undeploy the model
+                    resp = client.delete(
+                        http_server.MODEL_MANAGEMENT_ENDPOINT,
+                        params={"model_id": model_id},
+                    )
+                    resp.raise_for_status()
+
+                    # Make sure no models loaded
+                    assert not client.get(http_server.MODELS_INFO_ENDPOINT).json()[
+                        "models"
+                    ]
+
+                    # Make sure a 404 is raised if undeployed again
+                    resp = client.delete(
+                        http_server.MODEL_MANAGEMENT_ENDPOINT,
+                        params={"model_id": model_id},
+                    )
+                    assert resp.status_code == 404
 
 
-def test_uvicorn_server_config_invalid_kwarg_overlap():
-    """Make sure uvicorn config can't be set for configs that caikit manages"""
-    with temp_config(
-        {
-            "runtime": {
-                "http": {
-                    "server_config": {
-                        "log_level": "debug",
+def test_model_management_deploy_invalid(open_port):
+    """Test that attempting to deploy an invalid model fails"""
+    with tempfile.TemporaryDirectory() as workdir:
+        with non_singleton_model_managers(
+            1,
+            {
+                "runtime": {
+                    "local_models_dir": workdir,
+                    "lazy_load_local_models": True,
+                },
+            },
+            "merge",
+        ):
+            with runtime_http_test_server(open_port) as server:
+                with client_context(server) as client:
+
+                    # Make sure no models loaded initially
+                    resp = client.get(http_server.MODELS_INFO_ENDPOINT)
+                    resp.raise_for_status()
+                    model_info = resp.json()
+                    assert len(model_info["models"]) == 0
+
+                    # Do the deploy
+                    model_id = "my-model"
+                    deploy_req = {
+                        "model_id": model_id,
+                        "model_files": [
+                            {
+                                "filename": "foo.txt",
+                                "data": "yikes",  # <- not base64
+                            }
+                        ],
                     }
-                }
-            }
+                    resp = client.post(
+                        http_server.MODEL_MANAGEMENT_ENDPOINT, json=deploy_req
+                    )
+                    assert resp.status_code == 422  # Unprocessable
+
+
+def test_training_management_get_status(client):
+    """Test that training status can be retrieved"""
+    model_name = "sample_task_train"
+    json_input = {
+        "model_name": model_name,
+        "parameters": {
+            "training_data": {"data_stream": {"data": [{"number": 1}]}},
+            "batch_size": 42,
         },
-        "merge",
-    ):
-        with pytest.raises(ValueError):
-            http_server.RuntimeHTTPServer()
+    }
+    training_response = client.post(
+        "/api/v1/SampleTaskSampleModuleTrain",
+        json=json_input,
+    )
+
+    # Start the training and make sure it starts successfully
+    training_json_response = training_response.json()
+    training_response.raise_for_status()
+
+    # Get the status for the training
+    training_id = training_json_response["training_id"]
+    get_response = client.get(
+        http_server.TRAINING_MANAGEMENT_ENDPOINT, params={"training_id": training_id}
+    )
+    get_response.raise_for_status()
+
+
+def test_training_management_cancel(client):
+    """Test that trainings can be canceled"""
+    model_name = "sample_task_train"
+    json_input = {
+        "model_name": model_name,
+        "parameters": {
+            "training_data": {"data_stream": {"data": [{"number": 1}]}},
+            "batch_size": 42,
+            # Sleep the job so that cancellation can interrupt it. It will not
+            # sleep for this long in practice.
+            "sleep_time": 20,
+        },
+    }
+    training_response = client.post(
+        "/api/v1/SampleTaskSampleModuleTrain",
+        json=json_input,
+    )
+
+    # Start the training and make sure it starts successfully
+    training_json_response = training_response.json()
+    training_response.raise_for_status()
+
+    # Cancel the training
+    training_id = training_json_response["training_id"]
+    cancel_response = client.delete(
+        http_server.TRAINING_MANAGEMENT_ENDPOINT, params={"training_id": training_id}
+    )
+    cancel_response.raise_for_status()
+
+    # Make sure the status reflects being canceled
+    get_response = client.get(
+        http_server.TRAINING_MANAGEMENT_ENDPOINT, params={"training_id": training_id}
+    )
+    get_response.raise_for_status()
+    assert get_response.json()["state"] == "CANCELED"
+
+
+def test_training_management_errors(client):
+    """Test that training status can be retrieved"""
+    model_name = "sample_task_train"
+    json_input = {
+        "model_name": model_name,
+        "parameters": {
+            "training_data": {"data_stream": {"data": [{"number": 1}]}},
+            "batch_size": 42,
+        },
+    }
+    training_response = client.post(
+        "/api/v1/SampleTaskSampleModuleTrain",
+        json=json_input,
+    )
+
+    # Make sure unknown training GET returns 404
+    assert (
+        client.get(
+            http_server.TRAINING_MANAGEMENT_ENDPOINT, params={"training_id": "bad-id"}
+        ).status_code
+        == 404
+    )
+
+    # Make sure missing param returns 422
+    assert client.get(http_server.TRAINING_MANAGEMENT_ENDPOINT).status_code == 422
+
+    # Make sure unknown training DELETE returns 404
+    assert (
+        client.delete(
+            http_server.TRAINING_MANAGEMENT_ENDPOINT, params={"training_id": "bad-id"}
+        ).status_code
+        == 404
+    )

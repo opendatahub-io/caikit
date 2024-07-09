@@ -13,7 +13,7 @@
 # limitations under the License.
 # Standard
 from inspect import isclass
-from typing import Callable, Dict, Iterable, List, Type, TypeVar, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Type, TypeVar, Union
 import collections
 import dataclasses
 import typing
@@ -41,6 +41,8 @@ _STREAM_OUT_ANNOTATION = "__streaming_output_type"
 _STREAM_PARAMS_ANNOTATION = "__streaming_params"
 _UNARY_OUT_ANNOTATION = "__unary_output_type"
 _UNARY_PARAMS_ANNOTATION = "__unary_params"
+_VISIBLE_ANNOTATION = "__visible"
+_METADATA_ANNOTATION = "__metadata"
 
 
 class TaskBase:
@@ -61,6 +63,9 @@ class TaskBase:
         method_name: str  # the simple name of a method, like "run"
         input_streaming: bool
         output_streaming: bool
+        context_arg: Optional[
+            str
+        ]  # The name of the request context to pass if one is provided
 
     deferred_method_decorators: Dict[
         Type["TaskBase"], Dict[str, List["TaskBase.InferenceMethodPtr"]]
@@ -68,7 +73,10 @@ class TaskBase:
 
     @classmethod
     def taskmethod(
-        cls, input_streaming: bool = False, output_streaming: bool = False
+        cls,
+        input_streaming: bool = False,
+        output_streaming: bool = False,
+        context_arg: Optional[str] = None,
     ) -> Callable[[_InferenceMethodBaseT], _InferenceMethodBaseT]:
         """Decorates a module instancemethod and indicates whether the inputs and outputs should
         be handled as streams. This will trigger validation that the signature of this method
@@ -92,6 +100,7 @@ class TaskBase:
                     method_name=inference_method.__name__,
                     input_streaming=input_streaming,
                     output_streaming=output_streaming,
+                    context_arg=context_arg,
                 )
             )
             return inference_method
@@ -110,7 +119,9 @@ class TaskBase:
             keyname = _make_keyname_for_module(module)
             deferred_decorations = cls.deferred_method_decorators[cls][keyname]
             for decoration in deferred_decorations:
-                signature = CaikitMethodSignature(module, decoration.method_name)
+                signature = CaikitMethodSignature(
+                    module, decoration.method_name, decoration.context_arg
+                )
                 cls.validate_run_signature(
                     signature, decoration.input_streaming, decoration.output_streaming
                 )
@@ -169,9 +180,17 @@ class TaskBase:
         ).items():
             signature_type = signature.parameters[parameter_name]
             if parameter_type != signature_type:
-                if typing.get_origin(
-                    signature_type
-                ) == typing.Union and parameter_type in typing.get_args(signature_type):
+                if typing.get_origin(signature_type) == typing.Union and (
+                    # Either our parameter type is not a union & is part of the union signature
+                    parameter_type in typing.get_args(signature_type)
+                    # Or our parameter type is a union that's a subset of the union signature
+                    or (
+                        typing.get_origin(parameter_type) == typing.Union
+                        and set(typing.get_args(parameter_type)).issubset(
+                            set(typing.get_args(signature_type))
+                        )
+                    )
+                ):
                     continue
                 if input_streaming and cls._is_iterable_type(parameter_type):
                     streaming_type = typing.get_args(parameter_type)[0]
@@ -223,6 +242,20 @@ class TaskBase:
         if _STREAM_OUT_ANNOTATION not in cls.__annotations__:
             raise ValueError("No streaming outputs are specified for this task")
         return cls.__annotations__[_STREAM_OUT_ANNOTATION]
+
+    @classmethod
+    def get_visibility(cls) -> bool:
+        """Get the visibility for this task.
+
+        NOTE: defaults to True even if visibility wasn't provided"""
+        return cls.__annotations__.get(_VISIBLE_ANNOTATION, True)
+
+    @classmethod
+    def get_metadata(cls) -> Dict[str, Any]:
+        """Get any metadata defined for this task
+
+        NOTE: defaults to an empty dict if one wasn't provided"""
+        return cls.__annotations__.get(_METADATA_ANNOTATION, {})
 
     @classmethod
     def _raise_on_wrong_output_type(cls, output_type, module, output_streaming: bool):
@@ -284,6 +317,8 @@ def task(
     streaming_parameters: Dict[str, Type[Iterable[ValidInputTypes]]] = None,
     unary_output_type: Type[DataBase] = None,
     streaming_output_type: Type[Iterable[Type[DataBase]]] = None,
+    visible: bool = True,
+    metadata: Optional[Dict[str, Any]] = None,
     **kwargs,
 ) -> Callable[[Type[TaskBase]], Type[TaskBase]]:
     """The decorator for AI Task classes.
@@ -342,6 +377,12 @@ def task(
             task, which all modules' streaming-output inference methods must return. This must be
             in the form Iterable[T].
 
+        visible (bool): If this task should be exposed to the end user in documentation or if
+          it should only be used internally
+
+        metadata (Optional[Dict[str, Any]]): Any additional metadata that should
+          be included in the documentation for this task
+
     Returns:
         A decorator function for the task class, registering it with caikit's core registry of
             tasks.
@@ -364,6 +405,8 @@ def task(
             cls_annotations[_UNARY_OUT_ANNOTATION] = unary_output_type
         if streaming_output_type:
             cls_annotations[_STREAM_OUT_ANNOTATION] = streaming_output_type
+        cls_annotations[_VISIBLE_ANNOTATION] = visible
+        cls_annotations[_METADATA_ANNOTATION] = metadata or {}
 
         # Backwards compatibility with old-style @tasks
         if "required_parameters" in kwargs and not unary_parameters:

@@ -16,6 +16,7 @@ This file contains interfaces to handle information requests
 """
 
 # Standard
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 # First Party
@@ -24,6 +25,7 @@ import alog
 
 # Local
 from caikit.core.data_model import PACKAGE_COMMON, DataObjectBase, dataobject
+from caikit.core.data_model.json_dict import JsonDict
 
 log = alog.use_channel("RUNTIMEOPS")
 
@@ -31,17 +33,20 @@ RUNTIME_PACKAGE = f"{PACKAGE_COMMON}.runtime"
 
 
 @dataobject(RUNTIME_PACKAGE)
+@dataclass
 class RuntimeInfoRequest(DataObjectBase):
     """Empty request for runtime server information"""
 
 
 @dataobject(RUNTIME_PACKAGE)
+@dataclass
 class RuntimeInfoResponse(DataObjectBase):
     runtime_version: Annotated[Optional[str], FieldNumber(1)]
     python_packages: Annotated[Dict[str, str], FieldNumber(2)]
 
 
 @dataobject(RUNTIME_PACKAGE)
+@dataclass
 class ModelInfoRequest(DataObjectBase):
     """Empty request for runtime server information"""
 
@@ -49,6 +54,7 @@ class ModelInfoRequest(DataObjectBase):
 
 
 @dataobject(RUNTIME_PACKAGE)
+@dataclass
 class ModelInfo(DataObjectBase):
     """Information regarding a specific Model instance"""
 
@@ -56,7 +62,8 @@ class ModelInfo(DataObjectBase):
     model_path: Annotated[str, FieldNumber(1)]
     name: Annotated[str, FieldNumber(2)]
     size: Annotated[int, FieldNumber(3)]
-    metadata: Annotated[Dict[str, str], FieldNumber(4)]
+    metadata: Annotated[JsonDict, FieldNumber(4)]
+    loaded: Annotated[bool, FieldNumber(7)]
 
     # Module Information
     module_id: Annotated[str, FieldNumber(5)]
@@ -64,6 +71,7 @@ class ModelInfo(DataObjectBase):
 
 
 @dataobject(RUNTIME_PACKAGE)
+@dataclass
 class ModelInfoResponse(DataObjectBase):
     """Model Info response contains a list of ModelInfos"""
 

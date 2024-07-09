@@ -209,6 +209,7 @@ def validate_data_model(
     # this `cdm` was moved here from import-time
     cdm = get_data_model()
     for method in service_descriptor.methods:
+        log.debug("Validating method: %s", method.name)
         # Retrieve the descriptor of the input message for this RPC, and
         # verify that each field of the input message can be translated
         # into a corresponding object of the Caikit Library CDM, and that each
@@ -230,21 +231,27 @@ def validate_data_model(
                     )
                     continue
 
-                # ... or that we can get the field type name, e.g., RawDocument...
-                field_type = input_proto_msg.fields_by_name[
+                field_message_type = input_proto_msg.fields_by_name[
                     field.name
-                ].message_type.name
+                ].message_type
+                if (
+                    field_message_type.full_name
+                    not in DataBase.PROTO_CONVERSION_SPECIAL_TYPES
+                ):
 
-                # ...and ensuring that we can load a corresponding object from the Caikit* CDM
-                caikit_library_class = validate_caikit_library_class_exists(
-                    cdm, field_type
-                )
+                    # ... or that we can get the field type name, e.g., RawDocument...
+                    field_type = field_message_type.name
 
-                # ...and also ensuring that the Caikit Library CDM class has a `from_proto`
-                # method...
-                validate_caikit_library_class_method_exists(
-                    caikit_library_class, "from_proto"
-                )
+                    # ...and ensuring that we can load a corresponding object from the Caikit* CDM
+                    caikit_library_class = validate_caikit_library_class_exists(
+                        cdm, field_type
+                    )
+
+                    # ...and also ensuring that the Caikit Library CDM class has a `from_proto`
+                    # method...
+                    validate_caikit_library_class_method_exists(
+                        caikit_library_class, "from_proto"
+                    )
             else:
                 log.debug(
                     "<RUN51658879D>",
@@ -260,8 +267,13 @@ def validate_data_model(
         # all Caikit library modules should return well formed "predict" messages
         # from the data model.
         output_class = method.output_type.name
-        caikit_Library_class = validate_caikit_library_class_exists(cdm, output_class)
-        validate_caikit_library_class_method_exists(caikit_Library_class, "to_proto")
+        if method.output_type.full_name not in DataBase.PROTO_CONVERSION_SPECIAL_TYPES:
+            caikit_library_class = validate_caikit_library_class_exists(
+                cdm, output_class
+            )
+            validate_caikit_library_class_method_exists(
+                caikit_library_class, "to_proto"
+            )
 
 
 class ServicePackageStreamWrapper(DataStreamSourceBase):
@@ -391,7 +403,14 @@ def build_caikit_library_request_dict(
                 # Remove empty iterables since we cannot distinguish between
                 # unset and empty repeated fields
                 field_value = getattr(request, field.name)
-                if isinstance(field_value, Iterable) and len(field_value) == 0:
+                # Note: str and bytes will also get evaluated as Iterable and so empty
+                # strings would get considered as empty field. So we need to add
+                # explicit exclusion to avoid accidental conversion of "" to None
+                if (
+                    not isinstance(field_value, (str, bytes))
+                    and isinstance(field_value, Iterable)
+                    and len(field_value) == 0
+                ):
                     unset_field_names.append(field.name)
         for unset_field_name in unset_field_names:
             if unset_field_name in kwargs_dict:

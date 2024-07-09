@@ -45,7 +45,8 @@ from sample_lib.data_model import SampleInputType
 from tests.conftest import TempFailWrapper, random_test_id, temp_config
 from tests.core.helpers import TestFinder
 from tests.fixtures import Fixtures
-import caikit.runtime.model_management.model_loader
+from tests.runtime.conftest import deploy_good_model_files
+import caikit.runtime.model_management.model_loader_base
 
 get_dynamic_module("caikit.core")
 ANY_MODEL_TYPE = "test-any-model-type"
@@ -71,7 +72,7 @@ def temp_local_models_dir(workdir, model_manager=MODEL_MANAGER):
 def non_singleton_model_managers(num_mgrs=1, *args, **kwargs):
     with temp_config(*args, **kwargs):
         with patch(
-            "caikit.runtime.model_management.model_loader.MODEL_MANAGER",
+            "caikit.runtime.model_management.core_model_loader.MODEL_MANAGER",
             new_callable=CoreModelManager,
         ):
             instances = []
@@ -505,6 +506,55 @@ def test_model_manager_disk_caching_periodic_sync(good_model_path):
             assert mgr_one_unloaded and mgr_two_unloaded
 
 
+def test_periodic_sync_without_loading(good_model_path):
+    """Test that periodic synchronization of local_models_dir can proceed
+    without loading new models found there (unload only with lazy loading)
+    """
+    purge_period = 0.001
+    with TemporaryDirectory() as cache_dir:
+        # Copy the good model to the cache dir before starting the manager
+        model_id = random_test_id()
+        model_cache_path = os.path.join(cache_dir, model_id)
+        shutil.copytree(good_model_path, model_cache_path)
+
+        # Start the manager without loading new local models
+        with non_singleton_model_managers(
+            1,
+            {
+                "runtime": {
+                    "load_new_local_models": False,
+                    "local_models_dir": cache_dir,
+                    "lazy_load_local_models": True,
+                    "lazy_load_poll_period_seconds": purge_period,
+                    # NOTE: There won't be any initial model loads, but this
+                    #   ensures that if there were, they would happen
+                    #   synchronously during __init__
+                    "wait_for_initial_model_loads": True,
+                },
+            },
+            "merge",
+        ) as managers:
+            manager = managers[0]
+
+            # The model doesn't load at boot
+            assert model_id not in manager.loaded_models
+
+            # Wait for the purge period to run and make sure it's still not
+            # loaded
+            manager._lazy_sync_timer.join()
+            assert model_id not in manager.loaded_models
+
+            # Explicitly retrieve the model and make sure it _does_ lazy load
+            model = manager.retrieve_model(model_id)
+            assert model
+            assert model_id in manager.loaded_models
+
+            # Remove the file from local_models_dir and make sure it gets purged
+            shutil.rmtree(model_cache_path)
+            manager._lazy_sync_timer.join()
+            assert model_id not in manager.loaded_models
+
+
 def test_lazy_load_of_large_model(good_model_path):
     """Test that a large model that is actively being written to disk is not incorrectly loaded
     too soon by the lazy loading poll
@@ -722,6 +772,206 @@ def test_lazy_load_ephemeral_model():
             # Make sure the model does not get unloaded on sync
             manager._local_models_dir_sync(wait=True)
             assert model_id in manager.loaded_models
+
+
+def test_deploy_undeploy_model(deploy_good_model_files):
+    """Test that a model can be deployed by copying to the local models dir"""
+    with TemporaryDirectory() as cache_dir:
+        with non_singleton_model_managers(
+            1,
+            {
+                "runtime": {
+                    "local_models_dir": cache_dir,
+                    "lazy_load_local_models": True,
+                    "lazy_load_poll_period_seconds": 0,
+                },
+            },
+            "merge",
+        ) as managers:
+            manager = managers[0]
+            model_name = "my-model"
+
+            # Make sure model is not currently loaded
+            with pytest.raises(CaikitRuntimeException) as excinfo:
+                manager.retrieve_model(model_name)
+            assert excinfo.value.status_code == grpc.StatusCode.NOT_FOUND
+
+            # Do the deploy (pass wait through to load)
+            loaded_model = manager.deploy_model(
+                model_name, deploy_good_model_files, wait=True
+            )
+            assert loaded_model
+            assert loaded_model.loaded
+
+            # Make sure model can be retrieved and exists in the local models dir
+            assert manager.retrieve_model(model_name)
+            assert os.path.isdir(os.path.join(cache_dir, model_name))
+
+            # Make sure model cannot be deployed over
+            with pytest.raises(CaikitRuntimeException) as excinfo:
+                manager.deploy_model(model_name, deploy_good_model_files)
+            assert excinfo.value.status_code == grpc.StatusCode.ALREADY_EXISTS
+
+            # Undeploy the model
+            manager.undeploy_model(model_name)
+
+            # Make sure the model is not loaded anymore and was removed from
+            # local models dir
+            with pytest.raises(CaikitRuntimeException) as excinfo:
+                manager.retrieve_model(model_name)
+            assert excinfo.value.status_code == grpc.StatusCode.NOT_FOUND
+            assert not os.path.exists(os.path.join(cache_dir, model_name))
+
+
+@pytest.mark.parametrize(
+    ["invalid_fname", "expected_reason"],
+    [
+        ("", "Got whitespace-only model file name"),
+        ("\t\n  ", "Got whitespace-only model file name"),
+        ("/foo/bar.txt", "Cannot use absolute paths for model files"),
+    ],
+)
+def test_deploy_invalid_files(invalid_fname, expected_reason):
+    """Test that various flavors of invalid model names are not supported"""
+    with TemporaryDirectory() as cache_dir:
+        with non_singleton_model_managers(
+            1,
+            {
+                "runtime": {
+                    "local_models_dir": cache_dir,
+                    "lazy_load_local_models": True,
+                    "lazy_load_poll_period_seconds": 0,
+                },
+            },
+            "merge",
+        ) as managers:
+            manager = managers[0]
+            with pytest.raises(
+                CaikitRuntimeException, match=expected_reason
+            ) as excinfo:
+                manager.deploy_model("bad-model", {invalid_fname: b"asdf"})
+            assert excinfo.value.status_code == grpc.StatusCode.INVALID_ARGUMENT
+
+
+def test_deploy_with_nested_files(deploy_good_model_files):
+    """Make sure models with nested directories can be deployed"""
+    with TemporaryDirectory() as cache_dir:
+        with non_singleton_model_managers(
+            1,
+            {
+                "runtime": {
+                    "local_models_dir": cache_dir,
+                    "lazy_load_local_models": True,
+                    "lazy_load_poll_period_seconds": 0,
+                },
+            },
+            "merge",
+        ) as managers:
+            manager = managers[0]
+            model_name = "my-model"
+
+            # Read the model files and deploy
+            nested_dir = os.path.join("nested", "twice")
+            nested_fname = "foo.txt"
+            deploy_good_model_files[os.path.join(nested_dir, nested_fname)] = b"foo"
+            loaded_model = manager.deploy_model(
+                model_name, deploy_good_model_files, wait=True
+            )
+            assert loaded_model
+
+            # Make sure the nested file structure was set up correctly
+            local_nested_dir = os.path.join(cache_dir, model_name, nested_dir)
+            assert os.path.isdir(local_nested_dir)
+            assert os.path.exists(os.path.join(local_nested_dir, nested_fname))
+
+
+def test_deploy_invalid_permissions(deploy_good_model_files):
+    """Make sure that an error is raised if attempting to deploy when writing to
+    local_models_dir is denied
+    """
+    with TemporaryDirectory() as cache_dir:
+        local_models_dir = os.path.join(cache_dir, "local_models")
+        os.makedirs(local_models_dir)
+        os.chmod(local_models_dir, 0o600)
+        try:
+            with non_singleton_model_managers(
+                1,
+                {
+                    "runtime": {
+                        "local_models_dir": local_models_dir,
+                        "lazy_load_local_models": True,
+                        "lazy_load_poll_period_seconds": 0,
+                    },
+                },
+                "merge",
+            ) as managers:
+                manager = managers[0]
+                model_name = "my-model"
+
+                # Make sure the deploy fails with a permission error
+                with pytest.raises(CaikitRuntimeException) as excinfo:
+                    manager.deploy_model(model_name, deploy_good_model_files, wait=True)
+                assert excinfo.value.status_code == grpc.StatusCode.FAILED_PRECONDITION
+
+        finally:
+            os.chmod(local_models_dir, 0o777)
+            shutil.rmtree(local_models_dir)
+
+
+def test_undeploy_unkonwn_model():
+    """Make sure that attempting to undeploy an unknown model raises NOT_FOUND"""
+    with TemporaryDirectory() as cache_dir:
+        with non_singleton_model_managers(
+            1,
+            {
+                "runtime": {
+                    "local_models_dir": cache_dir,
+                    "lazy_load_local_models": True,
+                    "lazy_load_poll_period_seconds": 0,
+                },
+            },
+            "merge",
+        ) as managers:
+            manager = managers[0]
+            with pytest.raises(CaikitRuntimeException) as excinfo:
+                manager.undeploy_model("foobar")
+            assert excinfo.value.status_code == grpc.StatusCode.NOT_FOUND
+
+
+def test_undeploy_unloaded_model(deploy_good_model_files):
+    """If running with replicas and a shared local_models_dir, the replica that
+    gets the undeploy request may not have loaded the model into memory yet.
+    This tests that the model gets properly removed from local_models_dir, even
+    if not yet loaded.
+    """
+    with TemporaryDirectory() as cache_dir:
+        with non_singleton_model_managers(
+            1,
+            {
+                "runtime": {
+                    "local_models_dir": cache_dir,
+                    "lazy_load_local_models": True,
+                    "lazy_load_poll_period_seconds": 0,
+                },
+            },
+            "merge",
+        ) as managers:
+            manager = managers[0]
+
+            # Copy files to the local_models_dir
+            model_name = "foobar"
+            model_dir = os.path.join(cache_dir, model_name)
+            os.makedirs(model_dir)
+            for fname, data in deploy_good_model_files.items():
+                with open(os.path.join(model_dir, fname), "wb") as handle:
+                    handle.write(data)
+
+            # Make sure the undeploy completes successfully
+            assert model_name not in manager.loaded_models
+            assert os.path.exists(model_dir)
+            manager.undeploy_model(model_name)
+            assert model_name not in manager.loaded_models
+            assert not os.path.exists(model_dir)
 
 
 # ****************************** Unit Tests ****************************** #
@@ -1019,13 +1269,13 @@ def test_periodic_sync_handles_temporary_errors():
         ) as managers:
             manager = managers[0]
             flakey_loader = TempFailWrapper(
-                manager.model_loader._load_module,
+                manager.model_loader.load_module_instance,
                 num_failures=1,
                 exc=CaikitRuntimeException(grpc.StatusCode.INTERNAL, "Dang"),
             )
             with patch.object(
                 manager.model_loader,
-                "_load_module",
+                "load_module_instance",
                 flakey_loader,
             ):
                 assert manager._lazy_sync_timer is not None
@@ -1057,13 +1307,13 @@ def test_lazy_load_handles_temporary_errors():
         ) as managers:
             manager = managers[0]
             flakey_loader = TempFailWrapper(
-                manager.model_loader._load_module,
+                manager.model_loader.load_module_instance,
                 num_failures=1,
                 exc=CaikitRuntimeException(grpc.StatusCode.INTERNAL, "Dang"),
             )
             with patch.object(
                 manager.model_loader,
-                "_load_module",
+                "load_module_instance",
                 flakey_loader,
             ):
                 assert manager._lazy_sync_timer is None

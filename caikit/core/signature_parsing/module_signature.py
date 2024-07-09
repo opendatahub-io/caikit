@@ -53,18 +53,23 @@ class CaikitMethodSignature:
     """
 
     def __init__(
-        self, caikit_core_module: Type["caikit.core.ModuleBase"], method_name: str
+        self,
+        caikit_core_module: Type["caikit.core.ModuleBase"],
+        method_name: str,
+        context_arg: Optional[str] = None,
     ):
         self._module = caikit_core_module
         self._method_name = method_name
+        self._context_arg = context_arg
 
         try:
             self._method_pointer = getattr(self._module, self._method_name)
             self._default_map = parsers.get_args_with_defaults(self._method_pointer)
-            method_signature = inspect.signature(self._method_pointer)
+            self._method_signature = inspect.signature(self._method_pointer)
             self._return_type = parsers.get_output_type_name(
-                self._module, method_signature, self._method_pointer
+                self._module, self._method_signature, self._method_pointer
             )
+            self._qualified_name = self._method_pointer.__qualname__
 
             self._parameters = parsers.get_argument_types(self._method_pointer)
         except AttributeError:
@@ -101,6 +106,21 @@ class CaikitMethodSignature:
     def default_parameters(self) -> Dict[str, Any]:
         """A set of all parameter names which have default values"""
         return self._default_map
+
+    @property
+    def method_signature(self) -> inspect.Signature:
+        """The raw method signature for the Module function"""
+        return self._method_signature
+
+    @property
+    def qualified_name(self) -> str:
+        """The full qualified name for the source function"""
+        return self._qualified_name
+
+    @property
+    def context_arg(self) -> Optional[str]:
+        """The name of the context arg to pass to the function"""
+        return self._context_arg
 
 
 class CustomSignature(CaikitMethodSignature):

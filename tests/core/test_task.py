@@ -8,9 +8,20 @@ import pytest
 
 # Local
 from caikit.core import TaskBase, task
+from caikit.interfaces.common.data_model import File
 from sample_lib import SampleModule
-from sample_lib.data_model.sample import SampleInputType, SampleOutputType, SampleTask
-from sample_lib.modules.multi_task import FirstTask, MultiTaskModule, SecondTask
+from sample_lib.data_model.sample import (
+    OtherOutputType,
+    SampleInputType,
+    SampleOutputType,
+    SampleTask,
+)
+from sample_lib.modules.multi_task import (
+    ContextTask,
+    FirstTask,
+    MultiTaskModule,
+    SecondTask,
+)
 import caikit.core
 
 
@@ -171,7 +182,7 @@ def test_task_is_not_required_for_modules():
     class Stuff(caikit.core.ModuleBase):
         pass
 
-    assert Stuff.tasks == set()
+    assert Stuff.tasks == []
 
 
 def test_raises_if_tasks_not_list():
@@ -561,6 +572,80 @@ def test_decorator_adds_default_run_method_to_modules():
         ).method_name
         == "run"
     )
+
+
+def test_validation_allows_union_subsets():
+    """Validate that a task can take a union type that is a subset of implementing module types."""
+    # Task param types need to correctly map to proto types since they're used by runtime
+    @task(
+        unary_parameters={"sample_input": Union[str, int]},
+        unary_output_type=SampleOutputType,
+        streaming_output_type=Iterable[SampleOutputType],
+    )
+    class SomeTask(TaskBase):
+        pass
+
+    # But a module may consume types that are not backed by proto, e.g., PIL images
+    @caikit.core.module(
+        id=str(uuid.uuid4()),
+        name="SomeModule",
+        version="0.0.1",
+        task=SomeTask,
+    )
+    class SomeModule(caikit.core.ModuleBase):
+        def run(self, sample_input: Union[str, int, bytes]) -> SampleOutputType:
+            pass
+
+
+def test_validation_does_not_allow_union_supersets():
+    """Ensure that an implementing module cannot take a subset of param types of the task."""
+
+    @task(
+        unary_parameters={"sample_input": Union[str, int, bytes]},
+        unary_output_type=SampleOutputType,
+        streaming_output_type=Iterable[SampleOutputType],
+    )
+    class SomeTask(TaskBase):
+        pass
+
+    # If the task says bytes are okay, the module needs to be able to handle bytes also
+    with pytest.raises(TypeError):
+
+        @caikit.core.module(
+            id=str(uuid.uuid4()),
+            name="SomeModule",
+            version="0.0.1",
+            task=SomeTask,
+        )
+        class SomeModule(caikit.core.ModuleBase):
+            def run(self, sample_input: Union[str, int]) -> SampleOutputType:
+                pass
+
+
+def test_tasks_property_order():
+    """Ensure that the tasks returned by .tasks have a deterministic order that
+    respects the order given in the module decorator
+    """
+    assert MultiTaskModule.tasks == [FirstTask, SecondTask, ContextTask]
+
+
+def test_tasks_property_unique():
+    """Ensure that entries in the tasks list is unique even when inherited from
+    modules with the same tasks
+    """
+
+    @caikit.core.module(
+        id=str(uuid.uuid4()),
+        name="DerivedMultitaskModule",
+        version="0.0.1",
+        task=SecondTask,
+    )
+    class DerivedMultitaskModule(MultiTaskModule):
+        @SecondTask.taskmethod()
+        def run_second_task(self, file_input: File) -> OtherOutputType:
+            return OtherOutputType("I'm a derivative!")
+
+    assert DerivedMultitaskModule.tasks == [SecondTask, FirstTask, ContextTask]
 
 
 # ----------- BACKWARDS COMPATIBILITY ------------------------------------------- ##

@@ -3,9 +3,10 @@ This sets up global test configs when pytest starts
 """
 
 # Standard
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from functools import partial
-from typing import Dict, Type, Union
+from typing import Dict, Iterable, List, Optional, Type, Union
+from unittest import mock
 import os
 import shlex
 import socket
@@ -21,14 +22,20 @@ from grpc_health.v1 import health_pb2, health_pb2_grpc
 import grpc
 import pytest
 import requests
+import tls_test_tools
 
 # First Party
+import aconfig
 import alog
 
 # Local
 from caikit.core import MODEL_MANAGER
-from caikit.core.data_model.dataobject import render_dataobject_protos
-from caikit.runtime import http_server
+from caikit.core.data_model.dataobject import (
+    DataObjectBase,
+    dataobject,
+    render_dataobject_protos,
+)
+from caikit.runtime import http_server, trace
 from caikit.runtime.grpc_server import RuntimeGRPCServer
 from caikit.runtime.model_management.loaded_model import LoadedModel
 from caikit.runtime.model_management.model_manager import ModelManager
@@ -44,13 +51,22 @@ from tests.fixtures import Fixtures
 log = alog.use_channel("TEST-CONFTEST")
 
 
+def get_open_port():
+    """Non-fixture function to get an open port"""
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+        s.bind(("", 0))
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        port = s.getsockname()[1]
+        return port
+
+
 @pytest.fixture
 def open_port():
     """Get an open port on localhost
     Returns:
         int: Available port
     """
-    return _open_port()
+    return get_open_port()
 
 
 @pytest.fixture(scope="session")
@@ -59,7 +75,7 @@ def session_scoped_open_port():
     Returns:
         int: Available port
     """
-    return _open_port()
+    return get_open_port()
 
 
 @pytest.fixture(scope="session")
@@ -68,21 +84,7 @@ def http_session_scoped_open_port():
     Returns:
         int: Available port
     """
-    return _open_port()
-
-
-def _open_port(start=8888):
-    # TODO: This has obvious problems where the port returned for use by a test is not immediately
-    # put into use, so parallel tests could attempt to use the same port.
-    end = start + 1000
-    host = "localhost"
-    for port in range(start, end):
-        with socket.socket() as soc:
-            # soc.connect_ex returns 0 if connection is successful,
-            # indicating the port is in use
-            if soc.connect_ex((host, port)) != 0:
-                # So a non-zero code should mean the port is not currently in use
-                return port
+    return get_open_port()
 
 
 @pytest.fixture(scope="session")
@@ -98,12 +100,12 @@ def sample_inference_service(render_protos) -> ServicePackage:
     return inference_service
 
 
-@pytest.fixture(scope="session")
-def sample_predict_servicer(sample_inference_service) -> GlobalPredictServicer:
+@contextmanager
+def make_sample_predict_servicer(inference_service):
     interrupter = ThreadInterrupter()
     interrupter.start()
     servicer = GlobalPredictServicer(
-        inference_service=sample_inference_service, interrupter=interrupter
+        inference_service=inference_service, interrupter=interrupter
     )
     yield servicer
     # Make sure to not leave the rpc_meter hanging
@@ -112,6 +114,14 @@ def sample_predict_servicer(sample_inference_service) -> GlobalPredictServicer:
     if rpc_meter:
         rpc_meter.end_writer_thread()
     interrupter.stop()
+
+
+@pytest.fixture(scope="session")
+def sample_predict_servicer(
+    sample_inference_service,
+) -> Iterable[GlobalPredictServicer]:
+    with make_sample_predict_servicer(sample_inference_service) as servicer:
+        yield servicer
 
 
 @pytest.fixture(scope="session")
@@ -218,6 +228,17 @@ def runtime_http_server(
         http_session_scoped_open_port,
     ) as server:
         yield server
+
+
+@contextmanager
+def runtime_test_server(*args, protocol: str = "grpc", **kwargs):
+    """Helper function to yield either server"""
+    if protocol == "http":
+        with runtime_http_test_server(*args, **kwargs) as server:
+            yield server
+    elif protocol == "grpc":
+        with runtime_grpc_test_server(*args, **kwargs) as server:
+            yield server
 
 
 @pytest.fixture(scope="session")
@@ -327,6 +348,24 @@ def streaming_task_model_id(streaming_model_path) -> str:
 
     # teardown
     model_manager.unload_model(model_id)
+
+
+@pytest.fixture
+def bidi_streaming_task_model_id(bidi_streaming_model_path) -> str:
+    """Loaded model ID using model manager load model implementation"""
+    model_id = random_test_id()
+    model_manager = ModelManager.get_instance()
+    model_manager.load_model(
+        model_id,
+        local_model_path=bidi_streaming_model_path,
+        model_type=Fixtures.get_good_model_type(),
+    )
+    try:
+        yield model_id
+
+    # teardown
+    finally:
+        model_manager.unload_model(model_id)
 
 
 @pytest.fixture
@@ -481,3 +520,165 @@ def _check_http_server_readiness(server, config_overrides: Dict[str, Dict]):
                 "[HTTP server not ready]; will try to reconnect to test server in 0.01 second."
             )
             time.sleep(0.001)
+
+
+## TLS Helpers #####################################################################
+
+
+@dataobject(package="caikit_data_model.test")
+class KeyPair(DataObjectBase):
+    cert: str
+    key: str
+
+
+@dataobject(package="caikit_data_model.test")
+class TLSConfig(DataObjectBase):
+    server: KeyPair
+    client: KeyPair
+
+
+@contextmanager
+def generate_tls_configs(
+    port: int,
+    tls: bool = False,
+    mtls: bool = False,
+    inline: bool = False,
+    separate_client_ca: bool = False,
+    server_sans: Optional[List[str]] = None,
+    client_sans: Optional[List[str]] = None,
+    **http_config_overrides,
+) -> Dict[str, Dict]:
+    """Helper to generate tls configs"""
+    with tempfile.TemporaryDirectory() as workdir:
+        config_overrides = {}
+        client_keyfile, client_certfile = None, None
+        ca_cert, server_cert, server_key = None, None, None
+        use_in_test = config_overrides.setdefault("use_in_test", {})
+        use_in_test["workdir"] = workdir
+        if mtls or tls:
+            ca_key = tls_test_tools.generate_key()[0]
+            ca_cert = tls_test_tools.generate_ca_cert(ca_key)
+            server_key, server_cert = tls_test_tools.generate_derived_key_cert_pair(
+                ca_key=ca_key,
+                san_list=server_sans,
+            )
+            server_certfile, server_keyfile = save_key_cert_pair(
+                "server", workdir, server_key, server_cert
+            )
+
+            if inline:
+                tls_config = TLSConfig(
+                    server=KeyPair(cert=server_cert, key=server_key),
+                    client=KeyPair(cert="", key=""),
+                )
+            else:
+                tls_config = TLSConfig(
+                    server=KeyPair(cert=server_certfile, key=server_keyfile),
+                    client=KeyPair(cert="", key=""),
+                )
+
+            # need to save this ca_certfile in config_overrides so the tls
+            # tests below can access it from client side
+            ca_certfile, _ = save_key_cert_pair("ca", workdir, cert=ca_cert)
+            use_in_test["ca_cert"] = ca_certfile
+            use_in_test["server_key"] = server_keyfile
+            use_in_test["server_cert"] = server_certfile
+
+            # also saving a bad ca_certfile for a failure test case
+            bad_ca_file = os.path.join(workdir, "bad_ca_cert.crt")
+            with open(bad_ca_file, "w") as handle:
+                bad_cert = (
+                    "-----BEGIN CERTIFICATE-----\nfoobar\n-----END CERTIFICATE-----"
+                )
+                handle.write(bad_cert)
+            use_in_test["bad_ca_cert"] = bad_ca_file
+
+            if mtls:
+                if separate_client_ca:
+                    subject_kwargs = {"common_name": "my.client"}
+                    client_ca_key = tls_test_tools.generate_key()[0]
+                    client_ca_cert = tls_test_tools.generate_ca_cert(
+                        client_ca_key, **subject_kwargs
+                    )
+                else:
+                    subject_kwargs = {}
+                    client_ca_key = ca_key
+                    client_ca_cert = ca_cert
+
+                # If inlining the client CA
+                if inline:
+                    tls_config.client.cert = client_ca_cert
+                else:
+                    client_ca_certfile, _ = save_key_cert_pair(
+                        "client_ca", workdir, cert=client_ca_cert
+                    )
+                    tls_config.client.cert = client_ca_certfile
+
+                # Set up the client key/cert pair derived from the client CA
+                client_certfile, client_keyfile = save_key_cert_pair(
+                    "client",
+                    workdir,
+                    *tls_test_tools.generate_derived_key_cert_pair(
+                        ca_key=client_ca_key,
+                        san_list=client_sans,
+                        **subject_kwargs,
+                    ),
+                )
+                # need to save the client cert and key in config_overrides so the mtls test below can access it
+                use_in_test["client_cert"] = client_certfile
+                use_in_test["client_key"] = client_keyfile
+
+            config_overrides["runtime"] = {"tls": tls_config.to_dict()}
+        config_overrides.setdefault("runtime", {})["http"] = {
+            "server_shutdown_grace_period_seconds": 0.01,  # this is so the server is killed after 0.1 if no test is running
+            "port": port,
+            **http_config_overrides,
+        }
+
+        with temp_config(config_overrides, "merge"):
+            yield aconfig.Config(config_overrides)
+
+
+def save_key_cert_pair(prefix, workdir, key=None, cert=None):
+    crtfile, keyfile = None, None
+    if key is not None:
+        keyfile = os.path.join(workdir, f"{prefix}.key")
+        with open(keyfile, "w") as handle:
+            handle.write(key)
+    if cert is not None:
+        crtfile = os.path.join(workdir, f"{prefix}.crt")
+        with open(crtfile, "w") as handle:
+            handle.write(cert)
+    return crtfile, keyfile
+
+
+@pytest.fixture
+def deploy_good_model_files():
+    model_files = {}
+    model_path = Fixtures.get_good_model_path()
+    for fname in os.listdir(model_path):
+        with open(os.path.join(model_path, fname), "rb") as handle:
+            model_files[fname] = handle.read()
+    yield model_files
+
+
+@pytest.fixture
+def reset_trace():
+    """This fixture will cause all inline imports to be scoped to the duration
+    of the test and it will cause the trace module to revert to "unconfigured"
+    after tests complete.
+    """
+    sys_mod_copy = sys.modules.copy()
+    # NOTE: There is a strange import error in a circular import in
+    #   opentelemetry.metrics if we mock.patch sys.modules with the copy, so
+    #   instead we let the imports work with the real sys.modules and then prune
+    #   after the test. This is less robust to parallelism, but we don't run
+    #   tests in parallel for now anyway.
+    try:
+        with mock.patch.object(trace, "_TRACE_MODULE", None):
+            with mock.patch.object(trace, "_PROPAGATE_MODULE", None):
+                yield
+    finally:
+        new_mods = {mod for mod in sys.modules if mod not in sys_mod_copy}
+        for mod in new_mods:
+            sys.modules.pop(mod)

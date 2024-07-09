@@ -14,6 +14,7 @@
 
 # Local
 from . import training_management
+from .context import RuntimeServerContextType
 from .info import (
     ModelInfo,
     ModelInfoRequest,
@@ -21,6 +22,7 @@ from .info import (
     RuntimeInfoRequest,
     RuntimeInfoResponse,
 )
+from .model_management import DeployModelRequest, UndeployModelRequest
 from .training_management import (
     ModelPointer,
     TrainingInfoRequest,

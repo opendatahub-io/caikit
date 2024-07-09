@@ -22,27 +22,39 @@ from enum import Enum
 from typing import Optional, Type, Union
 import re
 
+# Third Party
+from grpc import StatusCode
+
 # First Party
 import alog
 
 # Local
 from caikit.config import get_config
+from caikit.core.exceptions.caikit_core_exception import CaikitCoreStatusCode
 from caikit.core.modules import ModuleBase
 from caikit.core.task import TaskBase
-from caikit.core.toolkit.name_tools import snake_to_upper_camel
+from caikit.core.toolkit.name_tools import camel_to_snake_case, snake_to_upper_camel
 from caikit.interfaces.runtime.data_model import (
+    DeployModelRequest,
+    ModelInfo,
     ModelInfoRequest,
     ModelInfoResponse,
     RuntimeInfoRequest,
     RuntimeInfoResponse,
     TrainingInfoRequest,
     TrainingStatusResponse,
+    UndeployModelRequest,
 )
 
 log = alog.use_channel("RNTM-NAMES")
 
 
-############# Serice Names ##############
+################################# Model Management Names #######################
+LOCAL_MODEL_TYPE = "standalone-model"
+DEFAULT_LOADER_NAME = "default"
+DEFAULT_SIZER_NAME = "default"
+
+################################# Service Names ################################
 
 
 class ServiceType(Enum):
@@ -52,9 +64,10 @@ class ServiceType(Enum):
     TRAINING = 2  # Training service for the GlobalTrainServicer
     TRAINING_MANAGEMENT = 3
     INFO = 4
+    MODEL_MANAGEMENT = 5
 
 
-############# Serice Name Generation ##############
+############################ Service Name Generation ###########################
 
 
 ##  Service Package Descriptors
@@ -90,7 +103,9 @@ def get_service_package_name(service_type: Optional[ServiceType] = None) -> str:
     if service_type == ServiceType.INFO:
         return INFO_SERVICE_PACKAGE
     elif service_type == ServiceType.TRAINING_MANAGEMENT:
-        return TRAINING_MANAGEMENT_PACKAGE
+        return TRAINING_MANAGEMENT_SERVICE_PACKAGE
+    elif service_type == ServiceType.MODEL_MANAGEMENT:
+        return MODEL_MANAGEMENT_SERVICE_PACKAGE
 
     caikit_config = get_config()
     ai_domain_name = get_ai_domain()
@@ -211,7 +226,7 @@ def get_task_predict_request_name(
 ##  Service Definitions
 
 TRAINING_MANAGEMENT_SERVICE_NAME = "TrainingManagement"
-TRAINING_MANAGEMENT_PACKAGE = "caikit.runtime.training"
+TRAINING_MANAGEMENT_SERVICE_PACKAGE = "caikit.runtime.training"
 TRAINING_MANAGEMENT_SERVICE_SPEC = {
     "service": {
         "rpcs": [
@@ -248,12 +263,29 @@ INFO_SERVICE_SPEC = {
     }
 }
 
+MODEL_MANAGEMENT_SERVICE_NAME = "ModelManagement"
+MODEL_MANAGEMENT_SERVICE_PACKAGE = "caikit.runtime.models"
+MODEL_MANAGEMENT_SERVICE_SPEC = {
+    "service": {
+        "rpcs": [
+            {
+                "name": "DeployModel",
+                "input_type": DeployModelRequest.get_proto_class().DESCRIPTOR.full_name,
+                "output_type": ModelInfo.get_proto_class().DESCRIPTOR.full_name,
+            },
+            {
+                "name": "UndeployModel",
+                "input_type": UndeployModelRequest.get_proto_class().DESCRIPTOR.full_name,
+                "output_type": UndeployModelRequest.get_proto_class().DESCRIPTOR.full_name,
+            },
+        ]
+    }
+}
 
-############### Server Names #############
+################################# Server Names #################################
 
 # Invocation metadata key for the model ID, provided by Model Mesh
 MODEL_MESH_MODEL_ID_KEY = "mm-model-id"
-
 
 ## HTTP Server
 
@@ -261,16 +293,26 @@ MODEL_MESH_MODEL_ID_KEY = "mm-model-id"
 HEALTH_ENDPOINT = "/health"
 
 # Endpoint to use for server info
-RUNTIME_INFO_ENDPOINT = "/info/version"
-MODELS_INFO_ENDPOINT = "/info/models"
+INFO_ENDPOINT = "/info"
+RUNTIME_INFO_ENDPOINT = f"{INFO_ENDPOINT}/version"
+MODELS_INFO_ENDPOINT = f"{INFO_ENDPOINT}/models"
+
+# Endpoints to use for resource management
+MANAGEMENT_ENDPOINT = "/management"
+MODEL_MANAGEMENT_ENDPOINT = f"{MANAGEMENT_ENDPOINT}/models"
+TRAINING_MANAGEMENT_ENDPOINT = f"{MANAGEMENT_ENDPOINT}/trainings"
 
 # These keys are used to define the logical sections of the request and response
 # data structures.
 REQUIRED_INPUTS_KEY = "inputs"
 OPTIONAL_INPUTS_KEY = "parameters"
 MODEL_ID = "model_id"
+EXTRA_OPENAPI_KEY = "extra_openapi"
 
-# Stream event types enum
+# Key representing the acknowledgement header sent in case of bi-directional streaming
+ACK_HEADER_STRING = "acknowledgement"
+
+# Stream event type for HTTP output streaming
 class StreamEventTypes(Enum):
     MESSAGE = "message"
     ERROR = "error"
@@ -289,11 +331,10 @@ def get_http_route_name(rpc_name: str) -> str:
         str: The name of the http route for RPC
     """
     if rpc_name.endswith("Predict"):
-        task_name = re.sub(
-            r"(?<!^)(?=[A-Z])",
-            "-",
+        task_name = camel_to_snake_case(
             re.sub("Task$", "", re.sub("Predict$", "", rpc_name)),
-        ).lower()
+            kebab_case=True,
+        )
         route = "/".join([get_config().runtime.http.route_prefix, "task", task_name])
         if route[0] != "/":
             route = "/" + route
@@ -306,7 +347,7 @@ def get_http_route_name(rpc_name: str) -> str:
     raise NotImplementedError(f"Unknown RPC type for rpc name {rpc_name}")
 
 
-### GRPC Server
+## GRPC Server
 
 
 def get_grpc_route_name(service_type: ServiceType, rpc_name: str) -> str:
@@ -319,3 +360,43 @@ def get_grpc_route_name(service_type: ServiceType, rpc_name: str) -> str:
         str: The name of the GRPC route for RPC
     """
     return f"/{get_service_package_name(service_type)}.{get_service_name(service_type)}/{rpc_name}"
+
+
+## Status Code Mappings
+
+STATUS_CODE_TO_HTTP = {
+    # Mapping from GRPC codes to their corresponding HTTP codes
+    # pylint: disable=line-too-long
+    # CITE: https://chromium.googlesource.com/external/github.com/grpc/grpc/+/refs/tags/v1.21.4-pre1/doc/statuscodes.md
+    StatusCode.OK: 200,
+    StatusCode.INVALID_ARGUMENT: 400,
+    StatusCode.FAILED_PRECONDITION: 400,
+    StatusCode.OUT_OF_RANGE: 400,
+    StatusCode.UNAUTHENTICATED: 401,
+    StatusCode.PERMISSION_DENIED: 403,
+    StatusCode.NOT_FOUND: 404,
+    StatusCode.ALREADY_EXISTS: 409,
+    StatusCode.ABORTED: 409,
+    StatusCode.RESOURCE_EXHAUSTED: 429,
+    StatusCode.CANCELLED: 499,
+    StatusCode.UNKNOWN: 500,
+    StatusCode.DATA_LOSS: 500,
+    StatusCode.UNIMPLEMENTED: 501,
+    StatusCode.UNAVAILABLE: 501,
+    StatusCode.DEADLINE_EXCEEDED: 504,
+    # Mapping from CaikitCore StatusCodes codes to their corresponding HTTP codes
+    CaikitCoreStatusCode.INVALID_ARGUMENT: 400,
+    CaikitCoreStatusCode.UNAUTHORIZED: 401,
+    CaikitCoreStatusCode.FORBIDDEN: 403,
+    CaikitCoreStatusCode.NOT_FOUND: 404,
+    CaikitCoreStatusCode.CONNECTION_ERROR: 500,
+    CaikitCoreStatusCode.UNKNOWN: 500,
+    CaikitCoreStatusCode.FATAL: 500,
+}
+
+# Invert STATUS_CODE_TO_HTTP preferring grpc.StatusCodes over CaikitCoreStatusCode
+# this is because CaikitRuntimeExceptions expect StatusCode and not the caikit version
+HTTP_TO_STATUS_CODE = {}
+for key, val in STATUS_CODE_TO_HTTP.items():
+    if val not in HTTP_TO_STATUS_CODE or isinstance(key, StatusCode):
+        HTTP_TO_STATUS_CODE[val] = key

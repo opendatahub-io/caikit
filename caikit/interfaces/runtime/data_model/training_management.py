@@ -18,37 +18,28 @@ from typing import List
 
 # First Party
 from py_to_proto.dataclass_to_proto import Annotated, FieldNumber
-import alog
 
 # Local
-from caikit.core.data_model import DataObjectBase, TrainingStatus, dataobject
-from caikit.core.toolkit.wip_decorator import Action, WipCategory, work_in_progress
-
-log = alog.use_channel("MDLOPS")
-
-RUNTIME_PACKAGE = "caikit_data_model.runtime"
+from ....core.data_model import DataObjectBase, TrainingStatus, dataobject
+from .package import RUNTIME_PACKAGE
 
 
-@work_in_progress(action=Action.WARNING, category=WipCategory.BETA)
 @dataobject(RUNTIME_PACKAGE)
 class TrainingInfoRequest(DataObjectBase):
     training_id: str
 
 
-@work_in_progress(action=Action.WARNING, category=WipCategory.BETA)
 @dataobject(RUNTIME_PACKAGE)
 class TrainingJob(DataObjectBase):
     training_id: str
     model_name: str
 
 
-@work_in_progress(action=Action.WARNING, category=WipCategory.BETA)
 @dataobject(RUNTIME_PACKAGE)
 class ModelPointer(DataObjectBase):
     model_id: str
 
 
-@work_in_progress(action=Action.WARNING, category=WipCategory.BETA)
 @dataobject(RUNTIME_PACKAGE)
 class TrainingStatusResponse(DataObjectBase):
     training_id: Annotated[str, FieldNumber(1)]
